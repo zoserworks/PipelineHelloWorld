@@ -51,9 +51,9 @@ jobs:
       - name: Configurar chave SSH
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.ASH1_SSH_KEY }}" > ~/.ssh/ash1_key
+          printf '%s\n' "${{ secrets.ASH1_SSH_KEY }}" > ~/.ssh/ash1_key
           chmod 600 ~/.ssh/ash1_key
-          ssh-keyscan -H ${{ secrets.ASH1_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+          ssh-keyscan -H ${{ secrets.ASH1_HOST }} >> ~/.ssh/known_hosts || true
 
       - name: Criar diretório da app se não existir
         run: |
