@@ -1,0 +1,142 @@
+# .github/workflows/deploy.yml
+# Esteira completa: testes → deploy na ash1 → notificação Discord
+
+name: Deploy zoser-dummy
+
+on:
+  workflow_dispatch:
+
+env:
+  APP_NAME: zoser-dummy
+  APP_DIR: /home/ubuntu/zoser-dummy
+  PYTHON_VERSION: "3.10"
+
+jobs:
+
+  # ----------------------------------------------------------
+  # JOB 1: Testes (roda nos servidores do GitHub — grátis)
+  # ----------------------------------------------------------
+  test:
+    name: Testes
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt pytest httpx
+
+      - name: Rodar testes
+        run: pytest test_app.py -v
+
+  # ----------------------------------------------------------
+  # JOB 2: Deploy na ash1 via SSH
+  # ----------------------------------------------------------
+  deploy:
+    name: Deploy → ash1
+    needs: test
+    runs-on: [self-hosted, ash2]   # runner está na ash2, acessa ash1 via SSH
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar chave SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.ASH1_SSH_KEY }}" > ~/.ssh/ash1_key
+          chmod 600 ~/.ssh/ash1_key
+          ssh-keyscan -H ${{ secrets.ASH1_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+      - name: Criar diretório da app se não existir
+        run: |
+          ssh -i ~/.ssh/ash1_key -o StrictHostKeyChecking=no \
+            ubuntu@${{ secrets.ASH1_HOST }} \
+            "mkdir -p ${{ env.APP_DIR }}"
+
+      - name: Sincronizar código
+        run: |
+          rsync -az --exclude='.git' --exclude='venv' --exclude='__pycache__' \
+            -e "ssh -i ~/.ssh/ash1_key -o StrictHostKeyChecking=no" \
+            ./ ubuntu@${{ secrets.ASH1_HOST }}:${{ env.APP_DIR }}/
+
+      - name: Instalar dependências e reiniciar via PM2
+        run: |
+          ssh -i ~/.ssh/ash1_key -o StrictHostKeyChecking=no \
+            ubuntu@${{ secrets.ASH1_HOST }} << 'ENDSSH'
+            set -e
+            cd ${{ env.APP_DIR }}
+
+            echo ">>> Criando/atualizando virtualenv..."
+            python3 -m venv venv
+            source venv/bin/activate
+            pip install -r requirements.txt --quiet
+
+            echo ">>> Reiniciando via PM2..."
+            pm2 describe ${{ env.APP_NAME }} > /dev/null 2>&1 \
+              && pm2 restart ${{ env.APP_NAME }} --update-env \
+              || pm2 start venv/bin/uvicorn \
+                   --name ${{ env.APP_NAME }} \
+                   -- app:app --host 127.0.0.1 --port 8100
+
+            pm2 save --force
+            echo ">>> Deploy concluído!"
+            pm2 list
+          ENDSSH
+
+      - name: Limpar chave SSH
+        if: always()
+        run: rm -f ~/.ssh/ash1_key
+
+  # ----------------------------------------------------------
+  # JOB 3: Notificação Discord
+  # ----------------------------------------------------------
+  notify:
+    name: Notificar Discord
+    needs: [test, deploy]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Definir status e cor
+        id: status
+        run: |
+          if [ "${{ needs.deploy.result }}" = "success" ]; then
+            echo "color=3066993"  >> $GITHUB_OUTPUT
+            echo "emoji=✅"       >> $GITHUB_OUTPUT
+            echo "msg=Deploy realizado com sucesso em ash1" >> $GITHUB_OUTPUT
+          elif [ "${{ needs.test.result }}" = "failure" ]; then
+            echo "color=15158332" >> $GITHUB_OUTPUT
+            echo "emoji=❌"       >> $GITHUB_OUTPUT
+            echo "msg=Testes falharam — deploy cancelado" >> $GITHUB_OUTPUT
+          else
+            echo "color=16776960" >> $GITHUB_OUTPUT
+            echo "emoji=⚠️"       >> $GITHUB_OUTPUT
+            echo "msg=Deploy falhou" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Enviar para Discord
+        run: |
+          curl -s -X POST "${{ secrets.DISCORD_WEBHOOK }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "embeds": [{
+                "title": "${{ steps.status.outputs.emoji }} zoser-dummy — ${{ steps.status.outputs.msg }}",
+                "color": ${{ steps.status.outputs.color }},
+                "fields": [
+                  {"name": "Repositório", "value": "${{ github.repository }}", "inline": true},
+                  {"name": "Branch",      "value": "${{ github.ref_name }}",   "inline": true},
+                  {"name": "Autor",       "value": "${{ github.actor }}",      "inline": true},
+                  {"name": "Commit",      "value": "`${{ github.event.head_commit.message }}`"}
+                ],
+                "footer": {"text": "SHA: ${{ github.sha }}"},
+                "timestamp": "${{ github.event.head_commit.timestamp }}"
+              }]
+            }'
